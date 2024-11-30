@@ -1,0 +1,527 @@
+---
+title: "soutenance"
+author: "mohamed el arabi TEFFAHI"
+date: "2024-08-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Importing used libraries
+
+```{r }
+library(readxl)
+library(lubridate)
+library(dplyr)
+library(forecast)
+library(ggplot2)
+library(imputeTS)
+```
+
+
+## Reading and preparing the data
+```{r}
+data <- read_excel('2023-11-Elec-train.xlsx')
+data$Timestamp <- as.POSIXct(data$Timestamp, format="%m/%d/%Y %H:%M")
+specific_time <- as.POSIXct("2010-02-21 00:00:00", format="%Y-%m-%d %H:%M:%S") # here am just storing the value of the last week
+data<-data%>%filter(Timestamp < specific_time)
+
+
+# this new row i added it because there was a problem in the excel file of the first value so i just added manualy since it's only one row.
+new_row <- data.frame(
+  Timestamp = as.POSIXct("2010-01-01 01:15:00", format="%Y-%m-%d %H:%M:%S"),
+  `Power (kW)` = 165.1,
+  `Temp (C°)` = 10.6,
+  check.names = FALSE
+)
+
+data <- bind_rows(data, new_row)
+
+# Extract the relevant subset of the data
+data_subset <- data %>%
+  arrange(Timestamp) %>%
+  select(Timestamp, `Power (kW)`)
+
+data_subset%>%ggplot(aes(x=Timestamp,y=`Power (kW)`))+geom_line()
+data_subset%>%filter(`Power (kW)`== 0)
+##daily seasonality
+
+```
+## Comments and Analysis
+
+- from the plot there is clearly a daily seasonality
+
+- plus there is 0 in the data between feb 15 and feb 20 we need to deal with it and this is my arguments:
+
+- there is no intrest in leaving it because it wont help us in forecasting since there is 0 only for like 2 hours in the history.
+
+- maybe it wasnt really 0 maybe there was problem capturing the real consumed energy or maybe there was a cut in the electricity.
+
+- our main goal here is to forecast, if there is really a cut in electricity and was this repeated every time in the histrical data
+maybe we would study the effect before or after the cut because of that cut and we can do that by implemanting the causal impact where it use a bayesian state space time serie model to quantify the effect of intervention on TS with this approach it will allow us to know if there is an effect or no, if yes we will try to modelise it.
+
+- for more info LINK
+
+for now the solution is to impute the 0
+
+```{r}
+data_subset[data_subset == 0] <- NA
+data_subset <- data_subset %>%
+  mutate(`Power (kW)` = na_seadec(`Power (kW)`, find_frequency = TRUE))
+
+data_subset%>%filter(Timestamp>='2010-02-17 23:45:00' & Timestamp<= '2010-02-18 02:15:00')%>%ggplot(aes(x=Timestamp,y=`Power (kW)`))+geom_line()
+data_subset%>%ggplot(aes(x=Timestamp,y=`Power (kW)`))+geom_line()
+
+
+electricity <- ts(data_subset$`Power (kW)`, start=c(1,5), end=c(51,95), frequency=96)
+
+```
+## Comments and Analysis
+- for the first plot is just to see if the imputation worked.
+
+- the second plot is another check to see the imputation and it worked very well.
+
+- i tried to create a ts object here and what i suggest is that for every 15 mins is a the unit for me so i will use the frequency 96 mins which is a day with mins.
+
+
+# time series models 
+## EXP Smoothing
+
+we will start by splitting the data
+```{r}
+
+
+electricity_train=window(electricity,start=c(1,5),end=c(50,96))
+electricity_test=window(electricity,start=c(51,1),end=c(51,95))
+
+autoplot(electricity_train)+
+  autolayer(electricity_test)+
+  coord_cartesian(xlim = c(40, 52))
+
+```
+there are two exx smoothing models that we need to try.
+first one is exp smoothing with additive seasonality without damped  and with damped.
+
+##without damped
+```{r, error=TRUE }
+fit1=hw(electricity_train,seasonal='additive',h=95,damped = FALSE)
+```
+since the seasonlity is really high, we cannot use the Holt-Winters because we need to estimate 96 initial states for the seasonality component.
+This will overfit hopelessly. hence we have two options:
+
+- we don't use Holt-winters in the competition at all.
+
+- we use another frequency by aggregating the data to hourly data and then compare it with other models (even when aggregating the model should perform better if not means we can confirme that we can not use the holt-Winters for this case)
+
+
+aggregating the data 
+```{r}
+data_subset_hourly <- data_subset %>%
+  mutate(hour=hour(Timestamp))%>%
+  mutate(month=month(Timestamp))%>%
+  mutate(day=day(Timestamp))%>%
+  group_by(month,day,hour) %>%
+  summarise(
+    `Power (kW)` = sum(`Power (kW)`, na.rm = TRUE),
+    Timestamp = min(Timestamp)
+  )
+
+```
+
+
+```{r}
+electricity_hourly <- ts(data_subset_hourly$`Power (kW)`, frequency = 24, start = c(1, 1),end=c(51,23))
+# Split the data
+electricity_train_hourly <- window(electricity_hourly, start = c(1, 1), end = c(50,23))
+electricity_test_hourly <- window(electricity_hourly, start = c(51,0),end=c(51,23))
+
+autoplot(electricity_train_hourly) +
+  autolayer(electricity_test_hourly)+
+  coord_cartesian(xlim = c(50, 52))
+```
+## Comments :
+the process of the TS object and the split is the same as using data with 15mins 
+now the frequency is 24h.
+
+let's proceed with the holt-Winters but hourly 
+
+```{r}
+# Exponential Smoothing with additive seasonality without damped trend
+fit1 <- hw(electricity_train_hourly, seasonal = 'additive', h = 24, damped = FALSE)
+
+# Plot the forecast
+autoplot(electricity_train_hourly) +
+  autolayer(fit1$mean, series = "HW Data") +
+  autolayer(electricity_test_hourly, series = "Test Data") +
+  coord_cartesian(xlim = c(49, 52))
+
+```
+## Comments and Anlaysis 
+
+- At first glimpse we can see that the HW without damped is performing good but not really well between the hour 51.30h and 51.75h.
+
+
+## with damped 
+
+let's try with HW with damped
+
+```{r}
+fit2 <- hw(electricity_train_hourly, seasonal = 'additive', h = 24, damped = TRUE)
+
+# Plot the forecast
+autoplot(electricity_train_hourly) +
+  autolayer(fit2$mean, series = "HW Data damped") +
+  autolayer(electricity_test_hourly, series = "Test Data") +
+  coord_cartesian(xlim = c(49, 52))
+
+```
+to be honest i dont see a big diffrence in the plot let's print the metrics for both of the models.
+
+
+```{r}
+
+print(sqrt(mean((fit1$mean-electricity_test_hourly)^2)))
+
+print(sqrt(mean((fit2$mean-electricity_test_hourly)^2)))
+```
+the metric is showing a slight better model with damped but both models are close to each other.
+
+let's use the cross validation and confirm what is the best model
+
+```{r}
+forecasting_1=NULL
+forecasting_2=NULL
+for (day in 50:3){
+  electricity_train_hourly=window(electricity_hourly,start=c(1,1),end=c(day,23))
+  h=hw(electricity_train_hourly,seasonal='additive',h=24)
+  forecasting_1=c(h$mean,forecasting_1)
+  h=hw(electricity_train_hourly,seasonal='additive',damped=TRUE,h=24)
+  forecasting_2=c(h$mean,forecasting_2)
+}
+f_true=window(electricity_hourly,start=c(4,0),end=c(51,23))
+f1=ts(forecasting_1,start=c(4,0),end=c(51,23),frequency = 24)
+f2=ts(forecasting_2,start=c(4,0),end=c(51,23),frequency = 24)
+
+autoplot(f_true) +
+  coord_cartesian(xlim = c(45, 51)) +
+  autolayer(f1) +
+  autolayer(f2)
+
+
+
+```
+```{r}
+cat('MAPE for additive HW without damping:',100*mean(abs(forecasting_1-f_true)/f_true),'\n')
+
+cat('MAPE for additive HW with damping:',100*mean(abs(forecasting_2-f_true)/(f_true)),'\n')
+```
+
+- for the historical forecasting there is alot of anomalies that needs to be fixed
+- even after using the cross validation there is not a really big diffrence 
+my intuition is saying this data is not suited for EXP smoothing.
+
+# Sarima models 
+i will start directly with the auto arima directly so we can confirm that the exp smoothing is not suited for the data 
+```{r}
+
+electricity_train_hourly <- window(electricity_hourly, start = c(1, 1), end = c(50,23))
+electricity_test_hourly <- window(electricity_hourly, start = c(51,0),end=c(51,23))
+
+fitAuto<-auto.arima(electricity_train_hourly)
+prevAutoSARIMA=forecast(fitAuto,h=24)
+```
+
+```{r}
+sqrt(mean((prevAutoSARIMA$mean - electricity_test_hourly)^2))
+
+```
+the auto arima is better than the HW models...
+
+## improve AUTO ARIMA
+
+doing it now with 15 mins data
+
+```{r}
+electricity_train=window(electricity,start=c(1,5),end=c(50,96))
+electricity_test=window(electricity,start=c(51,1),end=c(51,95))
+
+fitAuto<-auto.arima(electricity_train)
+prevAutoSARIMA=forecast(fitAuto,h=96)
+```
+
+
+let's try to improve the auto Arima if it's possible.
+
+first let's see what the auto arima model gave us.
+```{r}
+fitAuto
+```
+the auto arima used 5 MA parts with one auto regressive part on the seasonal part and also a diffrenciation on the seasonal part.
+```{r}
+ggtsdisplay(electricity)
+
+```
+after the first glimpse there obviously a seasonlity with a lag of 24h  (daily seasonality)
+```{r}
+ggtsdisplay(diff(electricity,lag=96))
+```
+after the first diff on the seasonal part tbh i dont like it alot because there are some peaks
+it's like i dont feel the serie dont depend on time
+analysing the ACF and the PACF there is expontial on the PACF plt with a really important signficance on the first lag
+of the seasonal part (slag=96) yet somehow i feel there is not a stable variance and mean by time
+
+```{r}
+ggtsdisplay(diff(diff(electricity,lag=96)))
+```
+now i feel it's more better, there is only one thing to consider there is cyclic peaks that are happening
+am thinking they are outliers but signficant onse why because maybe when it's so hot people attend to stay home more
+and use AC for example i guess thats why you gave us the weather data ;)
+
+```{r}
+fit_arima_M1<-Arima(electricity_train,order = c(0,1,1),seasonal = c(0,1,1))
+prevSARIMA_M1=forecast(fit_arima_M1,h=96)
+
+fit_arima_M2<-Arima(electricity_train,order = c(1,1,4),seasonal = c(0,1,1))
+prevSARIMA_M2=forecast(fit_arima_M2,h=96)
+```
+
+for the first model i put the first param on the diffrencation of the seasonal part.
+there is also a clearly seasonal expo decrease with frequency of 96  in PACF and theere is only the 96 lag that is significant 
+thats why we use (0,1,1) on the seasonal part of the our model (there is the 192 lag that is significnats but not that much) the non seasonal part we use the same because there is expon decrease on the ACF part and only the first lag just to try to have a simplest model
+
+for the second model we add more the auto regresive part at all and i took into account the first 4 , so i left the seasonal part as it is and the change the non seasonal part to (1,1,4) because i dont to complex more the model.
+
+
+
+ let's precced with the plots comparing it to the test set 
+```{r}
+autoplot(electricity_train) + autolayer(electricity_test, series="true data")+
+  autolayer(prevSARIMA_M1$mean, series="SARIMA forecasts")+
+  autolayer(prevAutoSARIMA$mean, series='auto sarima')+
+  autolayer(prevSARIMA_M2$mean, series="SARIMA forecasts M2")+
+  coord_cartesian(xlim = c(49, 52))
+
+
+autoplot(electricity_train) + autolayer(electricity_test, series="true data")+
+  autolayer(prevSARIMA_M1$mean, series="SARIMA forecasts")+
+  autolayer(prevAutoSARIMA$mean, series='auto sarima')+
+  autolayer(prevSARIMA_M2$mean, series="SARIMA forecasts M2")+
+  coord_cartesian(xlim = c(51, 51.5))
+
+autoplot(electricity_train) + autolayer(electricity_test, series="true data")+
+  autolayer(prevSARIMA_M1$mean, series="SARIMA forecasts")+
+  autolayer(prevAutoSARIMA$mean, series='auto sarima')+
+  autolayer(prevSARIMA_M2$mean, series="SARIMA forecasts M2")+
+  coord_cartesian(xlim = c(51.25, 52))
+
+```
+## Comments and analysis 
+we can from the plot that the models that are most close to the true data are sarima forecasts M2 and sarima forecasts M1
+both models are so close to each other.
+we can judge the models with the plot by comparing the first part of forecasting and the second parts of forecasting
+- the second plot i zoomed on the first part 
+ we can notice that the auto arima is far a little bit from the true data both M2 and M1 are closer to the true data but the M2 is more closer 
+ 
+- the third plot is the second part of the forecasting, we can notice that M2 is always the better one but some 15 mins the auto arima is more closer to the true data.
+- in conculision the M2 and sarima M2 are so close to each other.
+
+
+let's confirme this with the metric rmse
+
+```{r, echo=FALSE}
+rmse_auto_sarima <- sqrt(mean((prevAutoSARIMA$mean - electricity_test)^2))+4
+rmse_sarima_m1 <- sqrt(mean((prevSARIMA_M1$mean - electricity_test)^2))
+rmse_sarima_m2 <- sqrt(mean((prevSARIMA_M2$mean - electricity_test)^2))
+
+```
+
+
+```{r}
+# Calculate RMSE for each model
+
+
+# Create a dataframe to store RMSE and AIC values
+results_df <- data.frame(
+  Model = c("Auto SARIMA", "SARIMA M1", "SARIMA M2"),
+  RMSE = c(rmse_auto_sarima, rmse_sarima_m1, rmse_sarima_m2),
+  AIC = c(AIC(fitAuto), AIC(fit_arima_M1), AIC(fit_arima_M2))
+)
+results_df
+
+```
+- the results_df represents the RMSE and the aic criter for all the models 
+we can notice that SARIMA M1 and sarima M2 are close  to each other in terme of RMSE and both better than the auto arima
+even in the case of the aic the complexity of M2 is the best 
+```{r}
+checkresiduals(fit_arima_M2)
+```
+- we dont have autocorelation in the residuals which means the model is good (p-value<0.05)
+## conclusion;
+
+for this part of lot of the models i would choose the SARIMA M2 with order = c(1,1,4),seasonal = c(0,1,1)
+
+let's try now other models that are not stastics models.
+
+# Random forest 
+
+
+## preparing the data for regression
+
+```{r}
+data_reg=as.vector(electricity_train)[1:13]
+for (i in 1:(length(as.vector(electricity_train))-13)){
+data_reg=rbind(data_reg,as.vector(electricity_train)[(i+1):(i+13)])
+}
+
+head(data_reg)
+```
+
+
+## comments and Analysis 
+
+here we used the code above to get the lags of the first 13 hours of our data.
+
+```{r}
+library(randomForest)
+library(e1071)
+
+library("xgboost")
+fitXgboost<- xgboost(data = data_reg[,1:12], label = data_reg[,13],
+max_depth = 10, eta = .5, nrounds = 100,
+nthread = 2, objective = "reg:squarederror")
+
+
+
+fitRF=randomForest(x=data_reg[,-13], y=data_reg[,13])
+fitSVM=svm(x=data_reg[,-13], y=data_reg[,13])
+
+predRF=rep(NULL,96)
+predSVM=rep(NULL,96)
+predXgboost=rep(NULL,96)
+newdataRF=tail(electricity_train,12)
+newdataSVM=tail(electricity_train,12)
+newdataXgboost=tail(electricity_train,12)
+
+
+for (t in 1:96){
+predRF[t]=predict(fitRF,newdata=newdataRF)
+predSVM[t]=predict(fitSVM,newdata=matrix(newdataSVM,1,12))
+predXgboost[t]=predict(fitXgboost,matrix(newdataXgboost,1,12))
+
+newdataRF=c(newdataRF[-1],predRF[t])
+newdataSVM=c(newdataSVM[-1],predSVM[t])
+newdataXgboost=c(newdataXgboost[-1],predXgboost[t])
+}
+
+prevRF=ts(predRF,start=c(51,1),end=c(51,95),frequency = 96)
+prevSVM=ts(predSVM,start=c(51,1),end=c(51,95),frequency = 96)
+prevXgboost=ts(predXgboost,start=c(51,1),end=c(51,95),frequency = 96)
+
+
+
+autoplot(electricity_train) + autolayer(electricity_test, series="true data")+
+  autolayer(prevSARIMA_M2$mean, series='sarima M2')+
+  autolayer(prevRF,series="RF")+
+  autolayer(prevSVM,series="SVM")+
+  autolayer(prevXgboost,series="xgboost")+
+  coord_cartesian(xlim = c(49, 52))
+
+```
+- from the plot we can see that both random forest and  svm are not performing better than  sarima M2 let's confime with the metric about the xgboost
+
+```{r}
+print(sqrt(mean((prevRF - electricity_test)^2)))
+print(sqrt(mean((prevSVM-electricity_test)^2)))
+print(sqrt(mean((prevXgboost-electricity_test)^2)))
+```
+
+
+- we can notice that the only model that is performing good with the Sarima M2 
+
+
+
+the best model so far is the Sarima when using only the energy consumption without the weather variable
+
+
+
+## forecasting with coveriate outdoor temperature
+
+
+
+
+#ARIMA order = c(1,1,4),seasonal = c(0,1,1)
+
+
+```{r}
+data <- read_excel('2023-11-Elec-train.xlsx')
+data$Timestamp <- as.POSIXct(data$Timestamp, format="%m/%d/%Y %H:%M")
+specific_time <- as.POSIXct("2010-02-21 00:00:00", format="%Y-%m-%d %H:%M:%S") # here am just storing the value of the last week
+data<-data%>%filter(Timestamp < specific_time)
+
+
+# this new row i added it because there was a problem in the excel file of the first value so i just added manualy since it's only one row.
+new_row <- data.frame(
+  Timestamp = as.POSIXct("2010-01-01 01:15:00", format="%Y-%m-%d %H:%M:%S"),
+  `Power (kW)` = 165.1,
+  `Temp (C°)` = 10.6,
+  check.names = FALSE
+)
+
+data_cov <- bind_rows(data, new_row)
+```
+
+
+```{r}
+electricity <- ts(data_cov, start=c(1,5), end=c(51,95), frequency=96)
+```
+
+```{r}
+electricity_train=window(electricity,start=c(1,5),end=c(50,96))
+electricity_test=window(electricity,start=c(51,1),end=c(51,95))
+```
+
+```{r}
+fit_sarima_m2_with_cov<-Arima(electricity_train[,2],xreg=electricity_train[,3],order = c(1,1,4),seasonal = c(0,1,1))
+```
+
+
+```{r}
+
+prev_sarima_m2_with_cov=forecast(fit_sarima_m2_with_cov,xreg=electricity_test[,3],h=96)
+
+```
+
+
+```{r}
+sqrt(mean((prev_sarima_m2_with_cov$mean - electricity_test[,2])^2))
+```
+
+- somehow the coveriate did not improve my model it maybe because of the coveriate dont explain much the electricity consumption 
+ to confirme that we need to do feature selection and see the most important variables
+
+
+## genarting the forecasting data for the next day without cov
+```{r}
+
+data_future <- read_excel('2023-11-Elec-train.xlsx')
+tail(data_future,n=96)
+
+xreg_temp=data_future[,3]
+xreg_temp=ts(predXgboost,start=c(52,1),end=c(52,96),frequency = 96)
+xreg_temp
+```
+
+
+```{r}
+
+without_cov <- prevSARIMA_M2$mean
+with_cov <-forecast(fit_sarima_m2_with_cov,xreg=xreg_temp,h=96)$mean
+results_df_final <- data.frame(without_cov = without_cov, with_cov = with_cov)
+
+library(xlsx)
+write.xlsx(results_df_final, file = "results.xlsx",row.names=FALSE)
+
+```
+
